@@ -1,0 +1,193 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+#include "esp_http_server.h"
+
+
+// --- XIAO ESP32S3 Pins ---
+#define PWDN_GPIO_NUM     -1
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM     10
+#define SIOD_GPIO_NUM     40
+#define SIOC_GPIO_NUM     39
+#define Y9_GPIO_NUM       48
+#define Y8_GPIO_NUM       11
+#define Y7_GPIO_NUM       12
+#define Y6_GPIO_NUM       14
+#define Y5_GPIO_NUM       16
+#define Y4_GPIO_NUM       18
+#define Y3_GPIO_NUM       17
+#define Y2_GPIO_NUM       15
+#define VSYNC_GPIO_NUM    38
+#define HREF_GPIO_NUM     47
+#define PCLK_GPIO_NUM     13
+
+
+const char* ssid = "Ournetty2";
+const char* password = "$Octane1o";
+
+
+// --- Pillbot Motor Pins ---
+#define M1_IN1 4
+#define M1_IN2 5
+#define M1_EN  6
+#define M2_IN1 7
+#define M2_IN2 8
+#define M2_EN  9
+
+
+const int freq = 20000;
+const int pwmRes = 8;
+int speedVal = 200;
+
+
+httpd_handle_t camera_httpd = NULL;
+
+
+void motorsStop() {
+ digitalWrite(M1_IN1, LOW); digitalWrite(M1_IN2, LOW);
+ digitalWrite(M2_IN1, LOW); digitalWrite(M2_IN2, LOW);
+ ledcWrite(M1_EN, 0); ledcWrite(M2_EN, 0);
+}
+
+
+void move(int m1a, int m1b, int m2a, int m2b, const char* label) {
+ digitalWrite(M1_IN1, m1a); digitalWrite(M1_IN2, m1b);
+ digitalWrite(M2_IN1, m2a); digitalWrite(M2_IN2, m2b);
+ ledcWrite(M1_EN, speedVal); ledcWrite(M2_EN, speedVal);
+ Serial.printf("ACTION: %s | SPEED: %d\n", label, speedVal);
+}
+
+
+static const char PROGMEM INDEX_HTML[] = R"rawliteral(
+<!DOCTYPE html><html><head>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<style>
+ body { font-family: sans-serif; text-align: center; background: #0b1220; color: white; margin: 0; padding: 10px; }
+ img { width: 100%; max-width: 400px; border-radius: 12px; border: 2px solid #334155; margin-bottom: 15px; }
+ .btn { width: 80px; height: 65px; margin: 5px; background: #3b82f6; color: white; border-radius: 15px; font-weight: bold; cursor: pointer; border: none; transition: 0.1s; }
+ .btn:active { background: #60a5fa; transform: scale(0.9); }
+ .stop { background: #ef4444; width: 175px; margin-top: 10px; }
+</style></head>
+<body>
+ <h3>PILLBOT FAST-CORE</h3>
+ <img src="/stream">
+ <div style="margin:20px;"><input type="range" min="0" max="255" value="200" oninput="fetch('/speed?val='+this.value)" style="width:80%"></div>
+ <div>
+   <button class="btn" onmousedown="f('up')" onmouseup="f('stop')" ontouchstart="f('up')" ontouchend="f('stop')">UP</button><br>
+   <button class="btn" onmousedown="f('left')" onmouseup="f('stop')" ontouchstart="f('left')" ontouchend="f('stop')">LEFT</button>
+   <button class="btn" onmousedown="f('right')" onmouseup="f('stop')" ontouchstart="f('right')" ontouchend="f('stop')">RIGHT</button><br>
+   <button class="btn" onmousedown="f('down')" onmouseup="f('stop')" ontouchstart="f('down')" ontouchend="f('stop')">DOWN</button><br>
+   <button class="btn stop" onclick="f('stop')">STOP</button>
+ </div>
+ <script>function f(c){fetch(`/cmd?go=${c}`);}</script>
+</body></html>
+)rawliteral";
+
+
+static esp_err_t speed_handler(httpd_req_t *req){
+ char buf[32];
+ if (httpd_req_get_url_query_str(req, buf, sizeof(buf)) == ESP_OK) {
+   char p[16]; if (httpd_query_key_value(buf, "val", p, sizeof(p)) == ESP_OK) speedVal = atoi(p);
+ }
+ return httpd_resp_send(req, "OK", 2);
+}
+
+
+static esp_err_t stream_handler(httpd_req_t *req){
+ camera_fb_t * fb = NULL; esp_err_t res = ESP_OK; char part_buf[64];
+ httpd_resp_set_type(req, "multipart/x-mixed-replace;boundary=frame");
+ while(true){
+   fb = esp_camera_fb_get();
+   if (!fb) res = ESP_FAIL;
+   else {
+     size_t hlen = snprintf(part_buf, 64, "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", fb->len);
+     httpd_resp_send_chunk(req, part_buf, hlen);
+     httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
+     res = httpd_resp_send_chunk(req, "\r\n--frame\r\n", 11);
+     esp_camera_fb_return(fb);
+   }
+   if(res != ESP_OK) break;
+   vTaskDelay(2);
+ }
+ return res;
+}
+
+
+static esp_err_t cmd_handler(httpd_req_t *req){
+ char buf[32];
+ if (httpd_req_get_url_query_str(req, buf, sizeof(buf)) == ESP_OK) {
+   char p[16]; if (httpd_query_key_value(buf, "go", p, sizeof(p)) == ESP_OK) {
+     if (!strcmp(p, "up")) move(0,1,0,1, "UP");
+     else if (!strcmp(p, "down")) move(1,0,1,0, "DOWN");
+     else if (!strcmp(p, "left")) move(1,0,0,1, "LEFT");
+     else if (!strcmp(p, "right")) move(0,1,1,0, "RIGHT");
+     else { motorsStop(); Serial.println("ACTION: STOP"); }
+   }
+ }
+ return httpd_resp_send(req, "OK", 2);
+}
+
+
+static esp_err_t index_handler(httpd_req_t *req){ return httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN); }
+
+
+void setup() {
+ Serial.begin(115200);
+ delay(1000);
+ Serial.println("\n--- BOOTING PILLBOT ---");
+
+
+ pinMode(M1_IN1, OUTPUT); pinMode(M1_IN2, OUTPUT);
+ pinMode(M2_IN1, OUTPUT); pinMode(M2_IN2, OUTPUT);
+ ledcAttach(M1_EN, freq, pwmRes);
+ ledcAttach(M2_EN, freq, pwmRes);
+ motorsStop();
+ Serial.println("STEP 1: MOTOR PINS INITIALIZED");
+
+
+ camera_config_t config;
+ config.ledc_channel = LEDC_CHANNEL_0; config.ledc_timer = LEDC_TIMER_0;
+ config.pin_d0 = Y2_GPIO_NUM; config.pin_d1 = Y3_GPIO_NUM; config.pin_d2 = Y4_GPIO_NUM;
+ config.pin_d3 = Y5_GPIO_NUM; config.pin_d4 = Y6_GPIO_NUM; config.pin_d5 = Y7_GPIO_NUM;
+ config.pin_d6 = Y8_GPIO_NUM; config.pin_d7 = Y9_GPIO_NUM; config.pin_xclk = XCLK_GPIO_NUM;
+ config.pin_pclk = PCLK_GPIO_NUM; config.pin_vsync = VSYNC_GPIO_NUM; config.pin_href = HREF_GPIO_NUM;
+ config.pin_sscb_sda = SIOD_GPIO_NUM; config.pin_sscb_scl = SIOC_GPIO_NUM;
+ config.pin_pwdn = PWDN_GPIO_NUM; config.pin_reset = RESET_GPIO_NUM;
+ config.xclk_freq_hz = 10000000;
+ config.pixel_format = PIXFORMAT_JPEG;
+ config.frame_size = FRAMESIZE_QVGA;
+ config.jpeg_quality = 12;
+ config.fb_count = 2;
+  if(esp_camera_init(&config) == ESP_OK) {
+   Serial.println("STEP 2: CAMERA INITIALIZED");
+ } else {
+   Serial.println("STEP 2 ERROR: CAMERA FAILED");
+ }
+
+
+ WiFi.begin(ssid, password);
+ Serial.print("STEP 3: CONNECTING TO WIFI");
+ while (WiFi.status() != WL_CONNECTED) {
+   delay(500);
+   Serial.print(".");
+ }
+ Serial.println("\nWIFI CONNECTED!");
+ Serial.print("IP ADDRESS: "); Serial.println(WiFi.localIP());
+
+
+ httpd_config_t s_config = HTTPD_DEFAULT_CONFIG();
+ s_config.task_priority = 5;
+ if (httpd_start(&camera_httpd, &s_config) == ESP_OK) {
+   httpd_register_uri_handler(camera_httpd, new httpd_uri_t{"/", HTTP_GET, index_handler, NULL});
+   httpd_register_uri_handler(camera_httpd, new httpd_uri_t{"/cmd", HTTP_GET, cmd_handler, NULL});
+   httpd_register_uri_handler(camera_httpd, new httpd_uri_t{"/speed", HTTP_GET, speed_handler, NULL});
+   httpd_register_uri_handler(camera_httpd, new httpd_uri_t{"/stream", HTTP_GET, stream_handler, NULL});
+   Serial.println("STEP 4: SERVER STARTED");
+ }
+
+
+ Serial.println("--- SYSTEM READY ---");
+}
+
+
+void loop() { delay(1); }
