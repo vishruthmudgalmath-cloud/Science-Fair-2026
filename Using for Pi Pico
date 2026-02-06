@@ -1,0 +1,57 @@
+from machine import Pin, PWM
+import time
+
+# --- Status LED ---
+# This will blink once so you know the code started successfully on battery
+led = Pin(25, Pin.OUT) # Use Pin("LED") for Pico W
+led.value(1)
+time.sleep(0.5)
+led.value(0)
+
+# --- Signal Inputs from XIAO (D0-D3) ---
+sig_up    = Pin(0, Pin.IN, Pin.PULL_DOWN)
+sig_down  = Pin(1, Pin.IN, Pin.PULL_DOWN)
+sig_left  = Pin(2, Pin.IN, Pin.PULL_DOWN)
+sig_right = Pin(3, Pin.IN, Pin.PULL_DOWN)
+
+# --- L293D Output Pins ---
+en1 = PWM(Pin(6))
+en1.freq(1000)
+m1a = Pin(7, Pin.OUT)
+m1b = Pin(8, Pin.OUT)
+
+en2 = PWM(Pin(9))
+en2.freq(1000)
+m2a = Pin(10, Pin.OUT)
+m2b = Pin(11, Pin.OUT)
+
+# Speed (0 to 65535)
+SPEED = 55000 
+
+def drive(s1a, s1b, s2a, s2b):
+    m1a.value(s1a); m1b.value(s1b)
+    m2a.value(s2a); m2b.value(s2b)
+    en1.duty_u16(SPEED if (s1a or s1b) else 0)
+    en2.duty_u16(SPEED if (s2a or s2b) else 0)
+
+# Removed: Any 'while not Serial' checks that freeze the board
+print("Pico standing by...")
+
+while True:
+    # Read signals sent from XIAO
+    u, d, l, r = sig_up.value(), sig_down.value(), sig_left.value(), sig_right.value()
+    
+    if u:
+        drive(0, 1, 0, 1) # Forward
+    elif d:
+        drive(1, 0, 1, 0) # Backward
+    elif l:
+        drive(1, 0, 0, 1) # Left Spin
+    elif r:
+        drive(0, 1, 1, 0) # Right Spin
+    else:
+        drive(0, 0, 0, 0) # Halt
+        
+    time.sleep(0.01) # Small delay to keep the CPU cool
+
+
