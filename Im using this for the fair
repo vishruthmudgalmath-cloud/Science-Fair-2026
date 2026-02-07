@@ -1,0 +1,163 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+#include "esp_http_server.h"
+
+const char* ssid = "Ournetty2";
+const char* password = "$Octane1o";
+
+// --- Signal Pins to Pico (D1 - D4) ---
+#define SIG_UP    1  
+#define SIG_DOWN  2  
+#define SIG_LEFT  3  
+#define SIG_RIGHT 4  
+
+// --- XIAO ESP32S3 Camera Pins ---
+#define PWDN_GPIO_NUM     -1
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM     10
+#define SIOD_GPIO_NUM     40
+#define SIOC_GPIO_NUM     39
+#define Y9_GPIO_NUM       48
+#define Y8_GPIO_NUM       11
+#define Y7_GPIO_NUM       12
+#define Y6_GPIO_NUM       14
+#define Y5_GPIO_NUM       16
+#define Y4_GPIO_NUM       18
+#define Y3_GPIO_NUM       17
+#define Y2_GPIO_NUM       15
+#define VSYNC_GPIO_NUM    38
+#define HREF_GPIO_NUM     47
+#define PCLK_GPIO_NUM     13
+
+httpd_handle_t camera_httpd = NULL;
+
+void sendSignal(int u, int d, int l, int r) {
+  digitalWrite(SIG_UP, u);
+  digitalWrite(SIG_DOWN, d);
+  digitalWrite(SIG_LEFT, l);
+  digitalWrite(SIG_RIGHT, r);
+}
+
+static const char PROGMEM INDEX_HTML[] = R"rawliteral(
+<!DOCTYPE html><html><head>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<style>
+  body { font-family: sans-serif; text-align: center; background: #0b1220; color: white; margin: 0; padding: 10px; overflow: hidden; }
+  .stream-container { width: 100%; max-width: 400px; margin: auto; border: 2px solid #3b82f6; border-radius: 15px; overflow: hidden; background: black; }
+  img { width: 100%; display: block; }
+  .control-grid { display: grid; justify-content: center; gap: 10px; grid-template-areas: ". up ." "l s r" ". dn ."; margin-top: 15px; }
+  .btn { 
+    width: 95px; height: 85px; background: #1e293b; color: #60a5fa; border: 2px solid #3b82f6; 
+    border-radius: 12px; font-size: 13px; font-weight: bold; cursor: pointer; transition: 0.1s;
+    user-select: none; -webkit-tap-highlight-color: transparent;
+  }
+  .btn:active { background: #3b82f6; color: white; }
+  .up { grid-area: up; } .l { grid-area: l; } .r { grid-area: r; } .dn { grid-area: dn; }
+  .stop { grid-area: s; border-color: #ef4444; color: #ef4444; background: rgba(239, 68, 68, 0.1); }
+  .speed-box { margin: 15px auto; width: 80%; max-width: 300px; padding: 10px; background: rgba(255,255,255,0.05); border-radius: 10px; }
+  input[type=range] { width: 100%; accent-color: #3b82f6; }
+</style></head>
+<body>
+  <h3 style="margin:5px;">PILLBOT MISSION CONTROL</h3>
+  <div class="stream-container"><img src="/stream"></div>
+  
+  <div class="speed-box">
+    <label id="sp-lbl">MOTOR THRUST: 200</label><br>
+    <input type="range" id="speed" min="0" max="255" value="200" onchange="setSpeed(this.value)">
+  </div>
+
+  <div class="control-grid">
+    <button class="btn up" onclick="f('up')">FORWARD<br>▲</button>
+    <button class="btn l"  onclick="f('left')">LEFT SPIN<br>◀</button>
+    <button class="btn stop" onclick="f('stop')">STOP<br>■</button>
+    <button class="btn r"  onclick="f('right')">RIGHT SPIN<br>▶</button>
+    <button class="btn dn" onclick="f('down')">REVERSE<br>▼</button>
+  </div>
+
+  <script>
+    window.onload = function() {
+      const savedSpeed = localStorage.getItem('pillbotSpeed');
+      if(savedSpeed) {
+        document.getElementById('speed').value = savedSpeed;
+        setSpeed(savedSpeed);
+      }
+    };
+
+    function setSpeed(val) {
+      document.getElementById('sp-lbl').innerText = "MOTOR THRUST: " + val;
+      localStorage.setItem('pillbotSpeed', val);
+      fetch(`/speed?val=${val}`);
+    }
+
+    function f(c){ fetch(`/cmd?go=${c}`); }
+    
+    document.addEventListener('touchstart', function(e) { if(e.target.tagName=="BUTTON") e.preventDefault(); }, {passive:false});
+  </script>
+</body></html>
+)rawliteral";
+
+static esp_err_t cmd_handler(httpd_req_t *req){
+  char buf[32];
+  if (httpd_req_get_url_query_str(req, buf, sizeof(buf)) == ESP_OK) {
+    char p[16]; if (httpd_query_key_value(buf, "go", p, sizeof(p)) == ESP_OK) {
+      if (!strcmp(p, "up"))         sendSignal(1,0,0,0);
+      else if (!strcmp(p, "down"))  sendSignal(0,1,0,0);
+      else if (!strcmp(p, "left"))  sendSignal(0,0,1,0); 
+      else if (!strcmp(p, "right")) sendSignal(0,0,0,1); 
+      else                          sendSignal(0,0,0,0); 
+    }
+  }
+  return httpd_resp_send(req, "OK", 2);
+}
+
+static esp_err_t speed_handler(httpd_req_t *req){ return httpd_resp_send(req, "OK", 2); }
+
+static esp_err_t stream_handler(httpd_req_t *req){
+  camera_fb_t * fb = NULL; esp_err_t res = ESP_OK; char part_buf[64];
+  httpd_resp_set_type(req, "multipart/x-mixed-replace;boundary=frame");
+  while(true){
+    fb = esp_camera_fb_get();
+    if (!fb) { res = ESP_FAIL; }
+    else {
+      size_t hlen = snprintf(part_buf, 64, "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", fb->len);
+      httpd_resp_send_chunk(req, part_buf, hlen);
+      httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
+      res = httpd_resp_send_chunk(req, "\r\n--frame\r\n", 11);
+      esp_camera_fb_return(fb);
+    }
+    if(res != ESP_OK) break;
+  }
+  return res;
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(SIG_UP, OUTPUT); pinMode(SIG_DOWN, OUTPUT);
+  pinMode(SIG_LEFT, OUTPUT); pinMode(SIG_RIGHT, OUTPUT);
+  sendSignal(0,0,0,0);
+
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0; config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM; config.pin_d1 = Y3_GPIO_NUM; config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM; config.pin_d4 = Y6_GPIO_NUM; config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM; config.pin_d7 = Y9_GPIO_NUM; config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM; config.pin_vsync = VSYNC_GPIO_NUM; config.pin_href = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM; config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM; config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 10000000; config.pixel_format = PIXFORMAT_JPEG;
+  config.frame_size = FRAMESIZE_QVGA; config.jpeg_quality = 12; config.fb_count = 2;
+
+  esp_camera_init(&config);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) delay(500);
+
+  httpd_config_t s_config = HTTPD_DEFAULT_CONFIG();
+  if (httpd_start(&camera_httpd, &s_config) == ESP_OK) {
+    httpd_register_uri_handler(camera_httpd, new httpd_uri_t{"/", HTTP_GET, [](httpd_req_t *r){ return httpd_resp_send(r, INDEX_HTML, HTTPD_RESP_USE_STRLEN); }, NULL});
+    httpd_register_uri_handler(camera_httpd, new httpd_uri_t{"/cmd", HTTP_GET, cmd_handler, NULL});
+    httpd_register_uri_handler(camera_httpd, new httpd_uri_t{"/speed", HTTP_GET, speed_handler, NULL});
+    httpd_register_uri_handler(camera_httpd, new httpd_uri_t{"/stream", HTTP_GET, stream_handler, NULL});
+  }
+}
+
+void loop() { delay(1); }
