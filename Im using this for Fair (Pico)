@@ -1,0 +1,73 @@
+from machine import Pin, PWM
+import time
+
+# --- 1. SIGNAL INPUTS FROM XIAO ---
+# These pins listen for the 'Sticky' signals from the ESP32
+sig_up    = Pin(0, Pin.IN, Pin.PULL_DOWN) # GP0
+sig_down  = Pin(1, Pin.IN, Pin.PULL_DOWN) # GP1
+sig_left  = Pin(2, Pin.IN, Pin.PULL_DOWN) # GP2
+sig_right = Pin(3, Pin.IN, Pin.PULL_DOWN) # GP3
+
+# --- 2. MOTOR OUTPUTS (TO L293D) ---
+# Right Motor
+en1 = PWM(Pin(6))
+en1.freq(1000)
+m1a = Pin(7, Pin.OUT)
+m1b = Pin(8, Pin.OUT)
+
+# Left Motor
+en2 = PWM(Pin(9))
+en2.freq(1000)
+m2a = Pin(10, Pin.OUT)
+m2b = Pin(11, Pin.OUT)
+
+# --- 3. SPEED SETTING ---
+# 65535 is max speed. 50000-55000 is usually best for control.
+SPEED = 55000 
+
+def drive(r_fwd, r_back, l_fwd, l_back):
+    """
+    Controls the motor directions and sets the PWM speed.
+    """
+    # Right Motor Direction
+    m1a.value(r_fwd)
+    m1b.value(r_back)
+    
+    # Left Motor Direction
+    m2a.value(l_fwd)
+    m2b.value(l_back)
+    
+    # Apply PWM (Thrust) if any direction is active
+    en1.duty_u16(SPEED if (r_fwd or r_back) else 0)
+    en2.duty_u16(SPEED if (l_fwd or l_back) else 0)
+
+print("Pillbot Online - Waiting for Mission Control signals...")
+
+# --- 4. MAIN LOOP ---
+while True:
+    # Read all signals at once
+    u = sig_up.value()
+    d = sig_down.value()
+    l = sig_left.value()
+    r = sig_right.value()
+    
+    if u:
+        # FORWARD: Both motors forward
+        drive(1, 0, 1, 0)
+    elif d:
+        # REVERSE: Both motors backward
+        drive(0, 1, 0, 1)
+    elif l:
+        # LEFT SPIN: Right motor forward, Left motor back
+        drive(1, 0, 0, 1)
+    elif r:
+        # RIGHT SPIN: Left motor forward, Right motor back
+        drive(0, 1, 1, 0)
+    else:
+        # STOP: All pins low
+        drive(0, 0, 0, 0)
+        
+    # Small delay to keep the CPU cool
+    time.sleep(0.01)
+
+
