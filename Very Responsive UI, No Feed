@@ -1,0 +1,207 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <WiFiAP.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <AsyncWebSocket.h>  // For low-latency commands
+
+const char *ssid = "XIAO_ESP32S3";
+const char *password = "ROCKScienceFair";
+
+// Safe GPIOs - no conflict with camera on XIAO ESP32S3
+#define sig_up    1    // Right motor forward (IN1)
+#define sig_down  2    // Right motor backward (IN2)
+#define sig_left  3    // Left motor forward (IN3)
+#define sig_right 4    // Left motor backward (IN4)
+
+// --- XIAO ESP32S3 Camera Pins ---
+#define PWDN_GPIO_NUM     -1
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM     10
+#define SIOD_GPIO_NUM     40
+#define SIOC_GPIO_NUM     39
+#define Y9_GPIO_NUM       48
+#define Y8_GPIO_NUM       11
+#define Y7_GPIO_NUM       12
+#define Y6_GPIO_NUM       14
+#define Y5_GPIO_NUM       16
+#define Y4_GPIO_NUM       18
+#define Y3_GPIO_NUM       17
+#define Y2_GPIO_NUM       15
+#define VSYNC_GPIO_NUM    38
+#define HREF_GPIO_NUM     47
+#define PCLK_GPIO_NUM     13
+
+#define PART_BOUNDARY "123456789000000000000987654321"
+static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
+static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
+static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+
+// HTML with WebSocket instead of fetch
+static const char PROGMEM index_html[] = R"rawliteral(
+<!DOCTYPE html><html><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<style>
+  body { font-family: sans-serif; text-align: center; background: #0b1220; color: white; margin: 0; padding: 10px; }
+  .stream-container { width: 100%; max-width: 400px; margin: auto; border: 2px solid #3b82f6; border-radius: 15px; background: black; overflow: hidden; }
+  img { width: 100%; display: block; }
+  .grid { display: grid; justify-content: center; gap: 10px; grid-template-areas: ". u ." "l s r" ". d ."; margin-top: 20px; }
+  .btn { width: 80px; height: 80px; background: #1e293b; color: #60a5fa; border: 2px solid #3b82f6; border-radius: 12px; font-size: 24px; cursor: pointer; user-select: none; }
+  .btn:active { background: #3b82f6; color: white; }
+  .u { grid-area: u; } .l { grid-area: l; } .r { grid-area: r; } .d { grid-area: d; } .s { grid-area: s; border-color: #ef4444; color: #ef4444; }
+</style></head>
+<body>
+  <h3>XIAO Cam AP</h3>
+  <div class="stream-container"><img id="stream" src="/stream"></div>
+  <div class="grid">
+    <button class="btn u" ontouchstart="move('up')" ontouchend="move('stop')" onmousedown="move('up')" onmouseup="move('stop')">▲</button>
+    <button class="btn l" ontouchstart="move('left')" ontouchend="move('stop')" onmousedown="move('left')" onmouseup="move('stop')">◀</button>
+    <button class="btn s" onclick="move('stop')">■</button>
+    <button class="btn r" ontouchstart="move('right')" ontouchend="move('stop')" onmousedown="move('right')" onmouseup="move('stop')">▶</button>
+    <button class="btn d" ontouchstart="move('down')" ontouchend="move('stop')" onmousedown="move('down')" onmouseup="move('stop')">▼</button>
+  </div>
+  <script>
+    var ws = null;
+    function initWS() {
+      ws = new WebSocket('ws://' + location.hostname + '/ws');
+      ws.onopen = () => console.log('WebSocket connected');
+      ws.onclose = () => { console.log('WebSocket closed'); setTimeout(initWS, 1000); };
+      ws.onerror = (err) => console.log('WebSocket error:', err);
+    }
+    initWS();
+
+    function move(dir) {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(dir);
+      }
+    }
+  </script>
+</body></html>
+)rawliteral";
+
+void sendsignal(int u, int d, int l, int r) {
+  digitalWrite(sig_up,    u);
+  digitalWrite(sig_down,  d);
+  digitalWrite(sig_left,  l);
+  digitalWrite(sig_right, r);
+}
+
+// AsyncWebServer instance
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");  // WebSocket endpoint
+
+// Stream handler (MJPEG multipart)
+void handleStream(AsyncWebServerRequest *request) {
+  AsyncWebServerResponse *response = request->beginChunkedResponse(_STREAM_CONTENT_TYPE, [](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+    camera_fb_t * fb = esp_camera_fb_get();
+    if (!fb) {
+      return RESPONSE_TRY_AGAIN;
+    }
+
+    size_t len = 0;
+    // Boundary + header
+    if (index == 0) {
+      len = snprintf((char*)buffer, maxLen, "%sContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", _STREAM_BOUNDARY, fb->len);
+    } else {
+      len = fb->len;
+      memcpy(buffer, fb->buf, fb->len);
+    }
+
+    esp_camera_fb_return(fb);
+    return len;
+  });
+  request->send(response);
+}
+
+// WebSocket event handler - this is where commands arrive instantly
+void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {
+  if (type == WS_EVT_CONNECT) {
+    Serial.printf("WebSocket client #%u connected from %s\n", client->id(), client->remoteIP().toString().c_str());
+  } else if (type == WS_EVT_DISCONNECT) {
+    Serial.printf("WebSocket client #%u disconnected\n", client->id());
+  } else if (type == WS_EVT_DATA) {
+    data[len] = 0;  // Null terminate
+    String msg = (char*)data;
+    Serial.println("WS command: " + msg);
+
+    if (msg == "up")      sendsignal(1, 0, 1, 0);   // both forward
+    else if (msg == "down")  sendsignal(0, 1, 0, 1);   // both backward
+    else if (msg == "left")  sendsignal(1, 0, 0, 1);   // turn left
+    else if (msg == "right") sendsignal(0, 1, 1, 0);   // turn right
+    else                     sendsignal(0, 0, 0, 0);   // stop (also for unknown)
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  Serial.println("Starting...");
+
+  // Motor pins off first
+  digitalWrite(sig_up,    0);
+  digitalWrite(sig_down,  0);
+  digitalWrite(sig_left,  0);
+  digitalWrite(sig_right, 0);
+
+  pinMode(sig_up,    OUTPUT);
+  pinMode(sig_down,  OUTPUT);
+  pinMode(sig_left,  OUTPUT);
+  pinMode(sig_right, OUTPUT);
+
+  // Camera config
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0       = Y2_GPIO_NUM;
+  config.pin_d1       = Y3_GPIO_NUM;
+  config.pin_d2       = Y4_GPIO_NUM;
+  config.pin_d3       = Y5_GPIO_NUM;
+  config.pin_d4       = Y6_GPIO_NUM;
+  config.pin_d5       = Y7_GPIO_NUM;
+  config.pin_d6       = Y8_GPIO_NUM;
+  config.pin_d7       = Y9_GPIO_NUM;
+  config.pin_xclk     = XCLK_GPIO_NUM;
+  config.pin_pclk     = PCLK_GPIO_NUM;
+  config.pin_vsync    = VSYNC_GPIO_NUM;
+  config.pin_href     = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn     = PWDN_GPIO_NUM;
+  config.pin_reset    = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.frame_size   = FRAMESIZE_QVGA;  // Low res for better latency
+  config.jpeg_quality = 12;
+  config.fb_count     = 2;
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed 0x%x\n", err);
+    return;
+  }
+  Serial.println("Camera OK");
+
+  WiFi.softAP(ssid, password);
+  Serial.print("AP IP: "); Serial.println(WiFi.softAPIP());
+
+  // WebSocket setup
+  ws.onEvent(onWsEvent);
+  server.addHandler(&ws);
+
+  // Serve HTML
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send_P(200, "text/html", index_html);
+  });
+
+  // MJPEG stream
+  server.on("/stream", HTTP_GET, handleStream);
+
+  server.begin();
+  Serial.println("Async server + WebSocket started");
+}
+
+void loop() {
+  ws.cleanupClients();  // Important for AsyncWebSocket
+  delay(1);
+}
