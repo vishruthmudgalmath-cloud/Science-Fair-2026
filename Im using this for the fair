@@ -2,8 +2,8 @@
 #include <WiFi.h>
 #include "esp_http_server.h"
 
-const char* ssid = "Ournetty2";
-const char* password = "$Octane1o";
+const char* ssid = "*********";
+const char* password = "********";
 
 // --- Signal Pins to Pico (D1 - D4) ---
 #define SIG_UP    1  
