@@ -22,8 +22,8 @@
 #define PCLK_GPIO_NUM     13
 
 
-const char* ssid = "Ournetty2";
-const char* password = "$Octane1o";
+const char* ssid = "******";
+const char* password = "********";
 
 
 // --- Pillbot Motor Pins ---
