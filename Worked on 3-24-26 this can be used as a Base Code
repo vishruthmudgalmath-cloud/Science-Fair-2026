@@ -1,0 +1,213 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <WiFiAP.h>
+#include "esp_http_server.h"
+
+const char *ssid = "XIAO_ESP32S3";
+const char *password = "12345678";
+
+// NEW MOTOR PINS (as you changed them to 2,3,4,5)
+#define sig_up    2
+#define sig_down  3
+#define sig_left  4
+#define sig_right 5
+
+// Camera pins (OV3660 on XIAO Sense)
+#define PWDN_GPIO_NUM -1
+#define RESET_GPIO_NUM -1
+#define XCLK_GPIO_NUM 10
+#define SIOD_GPIO_NUM 40
+#define SIOC_GPIO_NUM 39
+#define Y9_GPIO_NUM 48
+#define Y8_GPIO_NUM 11
+#define Y7_GPIO_NUM 12
+#define Y6_GPIO_NUM 14
+#define Y5_GPIO_NUM 16
+#define Y4_GPIO_NUM 18
+#define Y3_GPIO_NUM 17
+#define Y2_GPIO_NUM 15
+#define VSYNC_GPIO_NUM 38
+#define HREF_GPIO_NUM 47
+#define PCLK_GPIO_NUM 13
+
+#define PART_BOUNDARY "123456789000000000000987654321"
+static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
+static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
+static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+
+static const char PROGMEM index_html[] = R"rawliteral(
+<!DOCTYPE html><html><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<style>
+  body { font-family: sans-serif; text-align: center; background: #0b1220; color: white; margin: 0; padding: 10px; }
+  .stream-container { width: 100%; max-width: 500px; margin: auto; border: 2px solid #3b82f6; border-radius: 15px; background: black; overflow: hidden; }
+  img { width: 100%; display: block; }
+  .grid { display: grid; justify-content: center; gap: 15px; grid-template-areas: ". u ." "l s r" ". d ."; margin-top: 25px; }
+  .btn { width: 90px; height: 90px; background: #1e293b; color: #60a5fa; border: 2px solid #3b82f6; border-radius: 15px; font-size: 32px; cursor: pointer; user-select: none; touch-action: manipulation; }
+  .btn:active { background: #3b82f6; color: white; }
+  .u { grid-area: u; } .l { grid-area: l; } .r { grid-area: r; } .d { grid-area: d; } .s { grid-area: s; border-color: #ef4444; color: #ef4444; }
+</style></head>
+<body>
+  <h3>Endoscopy Robot - Live Camera</h3>
+  <div class="stream-container"><img src="/stream"></div>
+  <div class="grid">
+    <button class="btn u" onmousedown="move('up')" onmouseup="move('stop')" ontouchstart="move('up')" ontouchend="move('stop')">▲</button>
+    <button class="btn l" onmousedown="move('left')" onmouseup="move('stop')" ontouchstart="move('left')" ontouchend="move('stop')">◀</button>
+    <button class="btn s" onclick="move('stop')">■</button>
+    <button class="btn r" onmousedown="move('right')" onmouseup="move('stop')" ontouchstart="move('right')" ontouchend="move('stop')">▶</button>
+    <button class="btn d" onmousedown="move('down')" onmouseup="move('stop')" ontouchstart="move('down')" ontouchend="move('stop')">▼</button>
+  </div>
+  <script>
+    function move(dir) {
+      fetch(`/control?var=${dir}&t=${Date.now()}`, {cache: 'no-store'});
+    }
+  </script>
+</body></html>
+)rawliteral";
+
+void sendsignal(int u, int d, int l, int r) {
+  digitalWrite(sig_up, u);
+  digitalWrite(sig_down, d);
+  digitalWrite(sig_left, l);
+  digitalWrite(sig_right, r);
+}
+
+static esp_err_t stream_handler(httpd_req_t *req) {
+  camera_fb_t * fb = NULL;
+  esp_err_t res = ESP_OK;
+  char part_buf[64];
+
+  res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
+  if (res != ESP_OK) return res;
+
+  while (true) {
+    fb = esp_camera_fb_get();
+    if (!fb) {
+      Serial.println("Capture failed");
+      res = ESP_FAIL;
+      break;
+    }
+
+    res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
+    if (res == ESP_OK) {
+      size_t hlen = snprintf(part_buf, 64, _STREAM_PART, fb->len);
+      res = httpd_resp_send_chunk(req, part_buf, hlen);
+    }
+    if (res == ESP_OK) {
+      res = httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
+    }
+    esp_camera_fb_return(fb);
+
+    if (res != ESP_OK) break;
+  }
+  return res;
+}
+
+static esp_err_t control_handler(httpd_req_t *req) {
+  char buf[64];
+  char param[32] = "stop";
+
+  if (httpd_req_get_url_query_str(req, buf, sizeof(buf)) == ESP_OK) {
+    httpd_query_key_value(buf, "var", param, sizeof(param));
+  }
+
+  Serial.printf("Control: %s\n", param);
+
+  // Motor mapping from your last working report
+  if (strcmp(param, "up") == 0)      sendsignal(0, 1, 1, 0);
+  else if (strcmp(param, "down") == 0) sendsignal(1, 0, 0, 1);
+  else if (strcmp(param, "left") == 0) sendsignal(1, 0, 0, 1);
+  else if (strcmp(param, "right") == 0) sendsignal(0, 1, 1, 0);
+  else sendsignal(0, 0, 0, 0);
+
+  httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+  return httpd_resp_send(req, "OK", 2);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("Starting...");
+
+  // Motors off
+  pinMode(sig_up, OUTPUT); digitalWrite(sig_up, 0);
+  pinMode(sig_down, OUTPUT); digitalWrite(sig_down, 0);
+  pinMode(sig_left, OUTPUT); digitalWrite(sig_left, 0);
+  pinMode(sig_right, OUTPUT); digitalWrite(sig_right, 0);
+
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.frame_size = FRAMESIZE_QVGA;
+  config.jpeg_quality = 8;
+  config.fb_count = 2;
+  config.fb_location = CAMERA_FB_IN_PSRAM;
+  config.grab_mode = CAMERA_GRAB_LATEST;
+
+  if (esp_camera_init(&config) != ESP_OK) {
+    Serial.println("Camera init failed");
+    return;
+  }
+
+  sensor_t *s = esp_camera_sensor_get();
+  s->set_quality(s, 8);
+
+  WiFi.softAP(ssid, password);
+  Serial.print("AP IP: "); Serial.println(WiFi.softAPIP());
+
+  httpd_config_t server_config = HTTPD_DEFAULT_CONFIG();
+  httpd_handle_t server = NULL;
+  if (httpd_start(&server, &server_config) == ESP_OK) {
+    httpd_uri_t index_uri = {
+      .uri = "/",
+      .method = HTTP_GET,
+      .handler = [](httpd_req_t *req){
+        httpd_resp_set_type(req, "text/html");
+        return httpd_resp_send(req, (const char *)index_html, strlen(index_html));
+      },
+      .user_ctx = NULL
+    };
+    httpd_register_uri_handler(server, &index_uri);
+
+    httpd_uri_t stream_uri = {
+      .uri = "/stream",
+      .method = HTTP_GET,
+      .handler = stream_handler,
+      .user_ctx = NULL
+    };
+    httpd_register_uri_handler(server, &stream_uri);
+
+    httpd_uri_t control_uri = {
+      .uri = "/control",
+      .method = HTTP_GET,
+      .handler = control_handler,
+      .user_ctx = NULL
+    };
+    httpd_register_uri_handler(server, &control_uri);
+
+    Serial.println("Server started - motors should work now");
+  }
+}
+
+void loop() {
+  delay(10);
+}
